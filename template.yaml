@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Daily Cloud Photo Backend
+  Cognito + API Gateway + Lambda + S3 + DynamoDB
+
+# ============================================================
+# Parameters
+# ============================================================
+Parameters:
+  AppName:
+    Type: String
+    Default: daily-cloud-photo
+    Description: Application name (used as prefix for resource names)
+
+  RequireEmail:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Require email address for signup
+
+  RequirePhone:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Require phone number for signup
+
+  PhotosBucketName:
+    Type: String
+    Default: ''
+    Description: S3 bucket name for photos (leave empty for auto-generated name)
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing the Lambda code ZIP
+
+  LambdaCodeKey:
+    Type: String
+    Default: 'daily-cloud-photo/lambda.zip'
+    Description: S3 key for the Lambda code ZIP file
+
+Conditions:
+  UseCustomBucketName: !Not [!Equals [!Ref PhotosBucketName, '']]
+  EmailRequired: !Equals [!Ref RequireEmail, 'true']
+
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # ── Cognito ──
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AppName}-user-pool'
+      AutoVerifiedAttributes:
+        - !If [EmailRequired, email, !Ref 'AWS::NoValue']
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: !If [EmailRequired, true, false]
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AppName}-app-client'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ── S3 (Photos) ──
+
+  PhotosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - UseCustomBucketName
+        - !Ref PhotosBucketName
+        - !Ref 'AWS::NoValue'
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  # ── DynamoDB ──
+
+  PhotosTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub '${AppName}-photos'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: photoId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: photoId
+          KeyType: RANGE
+
+  # ── IAM Role for Lambda ──
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AppPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminInitiateAuth
+                  - cognito-idp:SignUp
+                  - cognito-idp:ConfirmSignUp
+                  - cognito-idp:InitiateAuth
+                  - cognito-idp:GetUser
+                Resource: !GetAtt CognitoUserPool.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:HeadObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt PhotosBucket.Arn
+                  - !Sub '${PhotosBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt PhotosTable.Arn
+
+  # ── Lambda ──
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AppName}-api'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref CognitoUserPool
+          USER_POOL_CLIENT_ID: !Ref CognitoUserPoolClient
+          PHOTOS_BUCKET: !Ref PhotosBucket
+          PHOTOS_TABLE: !Ref PhotosTable
+          REQUIRE_EMAIL: !Ref RequireEmail
+          REQUIRE_PHONE: !Ref RequirePhone
+
+  # Lambda に API Gateway からの呼び出しを許可
+  ApiFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  # ── S3 Trigger Lambda ──
+
+  S3TriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AppName}-s3-trigger'
+      Runtime: python3.12
+      Handler: s3_trigger.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          PHOTOS_TABLE: !Ref PhotosTable
+
+  S3TriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3TriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  # ── API Gateway (HTTP API) ──
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AppName}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowHeaders: ['*']
+        AllowMethods: ['*']
+        AllowOrigins: ['*']
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: v1
+      AutoDeploy: true
+
+  # Lambda 統合
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # 全リクエストを Lambda にルーティング
+  HttpApiDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: '$default'
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  ApiEndpoint:
+    Description: API endpoint URL (give this to app users)
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+
+  PhotosBucketName:
+    Description: S3 bucket for photos
+    Value: !Ref PhotosBucket
